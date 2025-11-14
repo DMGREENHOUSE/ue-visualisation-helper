@@ -1,4 +1,7 @@
 # app.py
+from math import prod
+
+import numpy as np
 import pandas as pd
 import streamlit as st
 from viewer import PlotlyModelViewer
@@ -10,8 +13,42 @@ st.caption("Upload CSVs, pick up to 3 inputs and one output." \
             "\n Non-selected inputs are **frozen** to specified grid values.\n" \
             " Note: all validation points are overlaid if provided.\n")
 
+
+def _finite_bounds(values):
+    """Return (min, max) of finite numeric values or None if unavailable."""
+    series = values if isinstance(values, pd.Series) else pd.Series(values)
+    numeric = pd.to_numeric(series, errors="coerce")
+    arr = numeric.to_numpy(dtype=float, na_value=np.nan)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return None
+    return float(arr.min()), float(arr.max())
+
+
+def _meshgrid_summary(df: pd.DataFrame):
+    dims = {}
+    for col in df.columns:
+        vals = pd.unique(df[col].dropna())
+        dims[col] = int(len(vals))
+    expected = prod(max(1, d) for d in dims.values()) if dims else 0
+    looks_regular = len(df) > 0 and expected == len(df)
+    return dims, expected, looks_regular
+
+
+def _uncertainty_pct(pred_series: pd.Series, unc_series: pd.Series):
+    """Compute % uncertainty the same way the viewer does."""
+    val = pd.to_numeric(pred_series, errors="coerce").to_numpy(dtype=float, na_value=np.nan)
+    sig = pd.to_numeric(unc_series, errors="coerce").to_numpy(dtype=float, na_value=np.nan)
+    finite_abs = np.abs(val[np.isfinite(val)])
+    scale = float(finite_abs.max()) if finite_abs.size else 1.0
+    eps = max(1e-12, 1e-6 * max(scale, 1.0))
+    denom = np.maximum(np.abs(val), eps)
+    pct = 100.0 * sig / denom
+    return pct
+
 # ---------------------- Uploads ----------------------
 with st.sidebar:
+    st.image("assets/digilab.png", use_container_width=True)
     st.header("1) Upload CSV files")
     input_file   = st.file_uploader("test input (CSV)", type=["csv"], key="input_df")
     pred_file    = st.file_uploader("test prediction (CSV)",  type=["csv"], key="pred_df")
@@ -33,10 +70,39 @@ if len(input_df) != len(pred_df):
     st.error("`test input` and `test prediction` must have the **same number of rows** (aligned point-wise).")
     st.stop()
 
+grid_dims, expected_points, looks_regular = _meshgrid_summary(input_df)
+shape_str = " × ".join(f"{col}:{dim}" for col, dim in grid_dims.items()) or "n/a"
+if looks_regular:
+    st.success(f"Detected regular meshgrid with {len(grid_dims)} parameters ({shape_str}) covering {expected_points:,} points.")
+else:
+    st.warning(
+        f"The uploaded meshgrid looks irregular. Found {len(grid_dims)} parameters ({shape_str}) "
+        f"but expected {expected_points:,} points vs {len(input_df):,} rows."
+    )
+constant_cols = [col for col, dim in grid_dims.items() if dim <= 1]
+tunable_cols = [col for col, dim in grid_dims.items() if dim > 1]
+if constant_cols:
+    const_data = []
+    for col in constant_cols:
+        vals = pd.unique(input_df[col].dropna())
+        val = vals[0] if len(vals) else "NaN"
+        const_data.append(f"{col} = {val}")
+    st.info("Non-tunable inputs fixed in the meshgrid: " + "; ".join(const_data))
+with st.expander("Meshgrid breakdown", expanded=False):
+    st.dataframe(
+        pd.DataFrame({
+            "Parameter": list(grid_dims.keys()),
+            "Unique grid values": list(grid_dims.values())
+        })
+    )
+
 # ---------------------- Column selection ----------------------
 with st.sidebar:
     st.header("2) Select inputs & output")
-    input_cols = list(input_df.columns)
+    input_cols = tunable_cols
+    if not input_cols:
+        st.error("No tunable inputs detected (all input columns contain a single value).")
+        st.stop()
     output_cols = list(pred_df.columns)
 
     inputs = st.multiselect("Inputs (≤3)", input_cols, default=input_cols[:min(3, len(input_cols))], max_selections=3)
@@ -44,6 +110,57 @@ with st.sidebar:
         st.warning("Select at least one input.")
         st.stop()
     output = st.selectbox("Output", output_cols, index=0)
+
+    value_range = None
+    output_bounds = _finite_bounds(pred_df[output])
+    if output_bounds is None:
+        st.error(f"Output '{output}' does not contain numeric values.")
+        st.stop()
+    elif output_bounds[0] == output_bounds[1]:
+        st.info(f"{output} is constant at {output_bounds[0]:.3g}; range inputs disabled.")
+    else:
+        output_min_col, output_max_col = st.columns(2)
+        output_min = output_min_col.number_input(
+            f"{output} min",
+            value=float(output_bounds[0]),
+            help="Lower bound for the plotted output axis / colour scale.",
+            format="%.6g"
+        )
+        output_max = output_max_col.number_input(
+            f"{output} max",
+            value=float(output_bounds[1]),
+            help="Upper bound for the plotted output axis / colour scale.",
+            format="%.6g"
+        )
+        if output_min >= output_max:
+            st.error("Output min must be strictly less than max.")
+            st.stop()
+        value_range = (float(output_min), float(output_max))
+
+    uncert_range = None
+    if unc_df is not None and output in unc_df.columns:
+        pct_unc = _uncertainty_pct(pred_df[output], unc_df[output])
+        uncert_bounds = _finite_bounds(pct_unc)
+        if uncert_bounds is None or uncert_bounds[0] == uncert_bounds[1]:
+            st.info("Uncertainty values are constant; range inputs disabled.")
+        else:
+            unc_min_col, unc_max_col = st.columns(2)
+            unc_min = unc_min_col.number_input(
+                "Uncertainty [%] min",
+                value=float(uncert_bounds[0]),
+                help="Lower bound for the uncertainty colour scale.",
+                format="%.6g"
+            )
+            unc_max = unc_max_col.number_input(
+                "Uncertainty [%] max",
+                value=float(uncert_bounds[1]),
+                help="Upper bound for the uncertainty colour scale.",
+                format="%.6g"
+            )
+            if unc_min >= unc_max:
+                st.error("Uncertainty min must be strictly less than max.")
+                st.stop()
+            uncert_range = (float(unc_min), float(unc_max))
 
 # ---------------------- Frozen values for other inputs ----------------------
 other_inputs = [c for c in input_cols if c not in inputs]
@@ -54,6 +171,9 @@ with st.sidebar:
     if other_inputs:
         for col in other_inputs:
             options = sorted(pd.unique(input_df[col]))
+            if not options:
+                st.error(f"No valid grid values found for '{col}'. Please check the uploaded meshgrid file.")
+                st.stop()
             # choose middle unique value by default
             default = options[len(options)//2] if options else None
             # Select from actual grid values
@@ -84,7 +204,8 @@ download_config = {
 try:
     fig = viewer.build_figure(
         inputs=inputs, output=output, frozen=frozen,
-        mode3d=mode3d, vol_opacity=vol_opacity, vol_surface_count=vol_surface
+        mode3d=mode3d, vol_opacity=vol_opacity, vol_surface_count=vol_surface,
+        value_range=value_range, uncert_range=uncert_range
     )
     st.plotly_chart(fig, use_container_width=True, config=download_config)
 except Exception as e:
